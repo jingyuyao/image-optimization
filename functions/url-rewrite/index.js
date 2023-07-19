@@ -8,17 +8,21 @@ function handler(event) {
     var normalizedOperations = {};
     if (request.querystring) {
         Object.keys(request.querystring).forEach(operation => {
+            // Only `format`, `width` and `quality` are used by our frontend.
             switch (operation.toLowerCase()) {
                 case 'format': 
+                    // Only auto format is requested by our frontend.
                     var SUPPORTED_FORMATS = ['auto', 'jpeg', 'webp', 'avif', 'png', 'svg', 'gif'];
                     if (request.querystring[operation]['value'] && SUPPORTED_FORMATS.includes(request.querystring[operation]['value'].toLowerCase())) {
                         var format = request.querystring[operation]['value'].toLowerCase(); // normalize to lowercase
                         if (format === 'auto') {
                             format = 'jpeg';
                             if (request.headers['accept']) {
-                                if (request.headers['accept'].value.includes("avif")) {
-                                    format = 'avif';
-                                } else if (request.headers['accept'].value.includes("webp")) {
+                                // Only support webp auto format optimization:
+                                // - It encodes faster.
+                                // - Wider platform support: https://caniuse.com/webp
+                                // - One less set of copies in storage.
+                                if (request.headers['accept'].value.includes("webp")) {
                                     format = 'webp';
                                 } 
                             }
@@ -30,7 +34,8 @@ function handler(event) {
                     if (request.querystring[operation]['value']) {
                         var width = parseInt(request.querystring[operation]['value']);
                         if (!isNaN(width) && (width > 0)) {
-                            // you can protect the Lambda function by setting a max value, e.g. if (width > 4000) width = 4000;
+                            // Limit image size to 2k.
+                            if (width > 2048) width = 2048;
                             normalizedOperations['width'] = width.toString();
                         }
                     }
@@ -39,7 +44,8 @@ function handler(event) {
                     if (request.querystring[operation]['value']) {
                         var height = parseInt(request.querystring[operation]['value']);
                         if (!isNaN(height) && (height > 0)) {
-                            // you can protect the Lambda function by setting a max value, e.g. if (height > 4000) height = 4000;
+                            // Limit image size to 2k.
+                            if (height > 1080) height = 1080;
                             normalizedOperations['height'] = height.toString();
                         }
                     }
