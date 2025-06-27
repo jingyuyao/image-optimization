@@ -1,20 +1,16 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT-0
 
-const AWS = require('aws-sdk');
-const https = require('https');
-const Sharp = require('sharp');
+import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import Sharp from 'sharp';
 
-const S3 = new AWS.S3({ signatureVersion: 'v4', httpOptions: { agent: new https.Agent({ keepAlive: true }) } });
+const s3Client = new S3Client();
 const S3_ORIGINAL_IMAGE_BUCKET = process.env.originalImageBucketName;
 const S3_TRANSFORMED_IMAGE_BUCKET = process.env.transformedImageBucketName;
 const TRANSFORMED_IMAGE_CACHE_TTL = process.env.transformedImageCacheTTL;
-const SECRET_KEY = process.env.secretKey;
-const LOG_TIMING = process.env.logTiming;
+const MAX_IMAGE_SIZE = parseInt(process.env.maxImageSize);
 
-exports.handler = async (event) => {
-    // First validate if the request is coming from CloudFront
-    if (!event.headers['x-origin-secret-header'] || !(event.headers['x-origin-secret-header'] === SECRET_KEY)) return sendError(403, 'Request unauthorized', event);
+export const handler = async (event) => {
     // Validate if this is a GET request
     if (!event.requestContext || !event.requestContext.http || !(event.requestContext.http.method === 'GET')) return sendError(400, 'Only GET method is supported', event);
     // An example of expected path is /images/rio/1.jpeg/format=auto,width=100 or /images/rio/1.jpeg/original where /images/rio/1.jpeg is the path of the original image
@@ -24,29 +20,31 @@ exports.handler = async (event) => {
     // get the original image path images/rio/1.jpg
     imagePathArray.shift();
     var originalImagePath = imagePathArray.join('/');
-    // timing variable
-    var timingLog = "perf ";
+
     var startTime = performance.now();
     // Downloading original image
-    let originalImage;
+    let originalImageBody;
     let contentType;
     try {
-        originalImage = await S3.getObject({ Bucket: S3_ORIGINAL_IMAGE_BUCKET, Key: originalImagePath }).promise();
-        contentType = originalImage.ContentType;
+        const getOriginalImageCommand = new GetObjectCommand({ Bucket: S3_ORIGINAL_IMAGE_BUCKET, Key: originalImagePath });
+        const getOriginalImageCommandOutput = await s3Client.send(getOriginalImageCommand);
+        console.log(`Got response from S3 for ${originalImagePath}`);
+
+        originalImageBody = getOriginalImageCommandOutput.Body.transformToByteArray();
+        contentType = getOriginalImageCommandOutput.ContentType;
     } catch (error) {
-        return sendError(500, 'error downloading original image', error);
+        if (error.name === "NoSuchKey") {
+          return sendError(404, "The requested image does not exist", error);
+        }
+        return sendError(500, 'Error downloading original image', error);
     }
-    let transformedImage = Sharp(originalImage.Body, { failOn: 'none' });
+    let transformedImage = Sharp(await originalImageBody, { failOn: 'none', animated: true });
     // Get image orientation to rotate if needed
     const imageMetadata = await transformedImage.metadata();
-    //  execute the requested operations 
-    var operationsJSON = {};
-    var operationsArray = operationsPrefix.split(',');
-    operationsArray.forEach(operation => {
-        var operationKV = operation.split("=");
-        operationsJSON[operationKV[0]] = operationKV[1];
-    });
-    timingLog = timingLog + parseInt(performance.now() - startTime) + ' ';
+    // execute the requested operations 
+    const operationsJSON = Object.fromEntries(operationsPrefix.split(',').map(operation => operation.split('=')));
+    // variable holding the server timing header value
+    var timingLog = 'img-download;dur=' + parseInt(performance.now() - startTime);
     startTime = performance.now();
     try {
         // check if resizing is requested
@@ -61,7 +59,6 @@ exports.handler = async (event) => {
             var isLossy = false;
             switch (operationsJSON['format']) {
                 case 'jpeg': contentType = 'image/jpeg'; isLossy = true; break;
-                case 'svg': contentType = 'image/svg+xml'; break;
                 case 'gif': contentType = 'image/gif'; break;
                 case 'webp': contentType = 'image/webp'; isLossy = true; break;
                 case 'png': contentType = 'image/png'; break;
@@ -73,48 +70,69 @@ exports.handler = async (event) => {
                     quality: parseInt(operationsJSON['quality']),
                 });
             } else transformedImage = transformedImage.toFormat(operationsJSON['format']);
+        } else {
+            /// If not format is precised, Sharp converts svg to png by default https://github.com/aws-samples/image-optimization/issues/48
+            if (contentType === 'image/svg+xml') contentType = 'image/png';
         }
         transformedImage = await transformedImage.toBuffer();
     } catch (error) {
         return sendError(500, 'error transforming image', error);
     }
-    timingLog = timingLog + parseInt(performance.now() - startTime) + ' ';
-    startTime = performance.now();
+    timingLog = timingLog + ',img-transform;dur=' + parseInt(performance.now() - startTime);
+
+    // handle gracefully generated images bigger than a specified limit (e.g. Lambda output object limit)
+    const imageTooBig = Buffer.byteLength(transformedImage) > MAX_IMAGE_SIZE;
+
     // upload transformed image back to S3 if required in the architecture
     if (S3_TRANSFORMED_IMAGE_BUCKET) {
+        startTime = performance.now();
         try {
-            await S3.putObject({
+            const putImageCommand = new PutObjectCommand({
                 Body: transformedImage,
                 Bucket: S3_TRANSFORMED_IMAGE_BUCKET,
                 Key: originalImagePath + '/' + operationsPrefix,
                 ContentType: contentType,
-                Metadata: {
-                    'cache-control': TRANSFORMED_IMAGE_CACHE_TTL,
-                },
-            }).promise();
+                CacheControl: TRANSFORMED_IMAGE_CACHE_TTL,
+            })
+            await s3Client.send(putImageCommand);
+            timingLog = timingLog + ',img-upload;dur=' + parseInt(performance.now() - startTime);
+            // If the generated image file is too big, send a redirection to the generated image on S3, instead of serving it synchronously from Lambda. 
+            if (imageTooBig) {
+                return {
+                    statusCode: 302,
+                    headers: {
+                        'Location': '/' + originalImagePath + '?' + operationsPrefix.replace(/,/g, "&"),
+                        'Cache-Control': 'private,no-store',
+                        'Server-Timing': timingLog
+                    }
+                };
+            }
         } catch (error) {
-            sendError('APPLICATION ERROR', 'Could not upload transformed image to S3', error);
+            logError('Could not upload transformed image to S3', error);
         }
     }
-    timingLog = timingLog + parseInt(performance.now() - startTime) + ' ';
-    if (LOG_TIMING === 'true') console.log(timingLog);
-    // return transformed image
-    return {
+
+    // Return error if the image is too big and a redirection to the generated image was not possible, else return transformed image
+    if (imageTooBig) {
+        return sendError(403, 'Requested transformed image is too big', '');
+    } else return {
         statusCode: 200,
         body: transformedImage.toString('base64'),
         isBase64Encoded: true,
         headers: {
             'Content-Type': contentType,
-            'Cache-Control': TRANSFORMED_IMAGE_CACHE_TTL
+            'Cache-Control': TRANSFORMED_IMAGE_CACHE_TTL,
+            'Server-Timing': timingLog
         }
     };
 };
 
-function sendError(code, message, error) {
-    console.log('APPLICATION ERROR', message);
+function sendError(statusCode, body, error) {
+    logError(body, error);
+    return { statusCode, body };
+}
+
+function logError(body, error) {
+    console.log('APPLICATION ERROR', body);
     console.log(error);
-    return {
-        statusCode: code,
-        body: message,
-    };
 }
